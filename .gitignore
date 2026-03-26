@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 虚拟环境
+venv/
+.env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# 模型文件（很重要）
+*.pt
+*.pth
+*.ckpt
+
+# 数据集
+data/
+dataset/
+dataset_normal/
+
+# 日志
+logs/
+*.log
+
+# Mac 系统文件
+.DS_Store
+
+# VSCode
+.vscode/
+
+.idea/
