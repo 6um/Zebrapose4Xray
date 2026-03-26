@@ -353,7 +353,12 @@ def main():
     set_seed(args.seed)
     os.makedirs(args.save_dir, exist_ok=True)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     print(f"[INFO] device = {device}")
 
     dataset = XrayCodeDataset(args.data_root)
