@@ -31,3 +31,5 @@ logs/
 .vscode/
 
 .idea/
+
+checkpoints/

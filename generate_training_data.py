@@ -13,7 +13,7 @@ from typing import Tuple, Dict
 
 
 # ============================================================
-# 1. 基础配置
+# 1. Basic Configuration
 # ============================================================
 
 def build_config(base_folder: str) -> Dict:
@@ -84,7 +84,7 @@ def build_config(base_folder: str) -> Dict:
 
 
 # ============================================================
-# 2. 随机姿态
+# 2. Random Pose
 # ============================================================
 
 def create_random_pose(run_id: int) -> Dict:
@@ -111,7 +111,7 @@ def create_random_pose(run_id: int) -> Dict:
 
 
 # ============================================================
-# 3. GVXR: X-ray 成像
+# 3. GVXR: X-ray Imaging
 # ============================================================
 
 def create_gvxr_context(cfg: Dict) -> None:
@@ -186,7 +186,7 @@ def render_xray_projection() -> Image.Image:
 
 
 # ============================================================
-# 4. PyVista: 与 X-ray 对齐的透视投影
+# 4. PyVista: Perspective Projection Aligned with X-ray
 # ============================================================
 
 def apply_pose_to_mesh(mesh: pv.PolyData, random_pose: Dict) -> pv.PolyData:
@@ -296,7 +296,7 @@ def render_bit_image(
 
 
 # ============================================================
-# 5. 10-bit code 生成
+# 5. 10-bit Code Generation
 # ============================================================
 
 def create_code_stack(
@@ -349,7 +349,7 @@ def make_code_visualization(packed_code: np.ndarray, mask: np.ndarray) -> np.nda
 
 
 # ============================================================
-# 6. 保存一个样本
+# 6. Save a Sample
 # ============================================================
 
 def save_sample(
@@ -414,7 +414,7 @@ def save_sample(
 
 
 # ============================================================
-# 7. 生成单个样本
+# 7. Generate a Single Sample
 # ============================================================
 
 def generate_one_sample(cfg: Dict, output_root: str, run_id: int) -> None:
@@ -442,7 +442,7 @@ def generate_one_sample(cfg: Dict, output_root: str, run_id: int) -> None:
 
 
 # ============================================================
-# 8. 批量生成（改为 subprocess）
+# 8. Batch Generation (Using subprocess)
 # ============================================================
 
 def generate_dataset_with_subprocess(
@@ -477,7 +477,7 @@ def generate_dataset_with_subprocess(
 
 
 # ============================================================
-# 9. 命令行参数
+# 9. Command Line Arguments
 # ============================================================
 
 def parse_args() -> argparse.Namespace:
@@ -526,7 +526,7 @@ def parse_args() -> argparse.Namespace:
 
 
 # ============================================================
-# 10. 主函数
+# 10. Main Function
 # ============================================================
 
 def main() -> None:

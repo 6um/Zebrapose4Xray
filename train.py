@@ -16,7 +16,7 @@ from torchvision import models
 
 
 # ============================================================
-# 1. 随机种子
+# 1. Random Seed 
 # ============================================================
 
 def set_seed(seed: int = 42):
@@ -32,7 +32,7 @@ def set_seed(seed: int = 42):
 
 class XrayCodeDataset(Dataset):
     """
-    数据目录结构假设为：
+    Expected dataset directory structure:
 
     dataset/
         sample_000000/
@@ -110,7 +110,7 @@ class ResNetSegmentation(nn.Module):
         else:
             raise ValueError(f"Unsupported backbone: {backbone}")
 
-        # 把第一层改成单通道输入
+        # Modify first convolution layer to accept single-channel input
         old_conv1 = base.conv1
         base.conv1 = nn.Conv2d(
             1, old_conv1.out_channels,
@@ -120,6 +120,7 @@ class ResNetSegmentation(nn.Module):
             bias=False
         )
 
+        # Initialize weights for single-channel input if using pretrained model
         if pretrained:
             with torch.no_grad():
                 base.conv1.weight[:] = old_conv1.weight.mean(dim=1, keepdim=True)
@@ -129,11 +130,11 @@ class ResNetSegmentation(nn.Module):
             base.bn1,
             base.relu
         )
-        self.maxpool = base.maxpool   # /4
-        self.layer1 = base.layer1     # /4
-        self.layer2 = base.layer2     # /8
-        self.layer3 = base.layer3     # /16
-        self.layer4 = base.layer4     # /32
+        self.maxpool = base.maxpool  # downsample /4
+        self.layer1 = base.layer1  # /4
+        self.layer2 = base.layer2  # /8
+        self.layer3 = base.layer3  # /16
+        self.layer4 = base.layer4  # /32
 
         # Decoder
         self.up4 = self._up_block(feat_channels[4], 256)
@@ -167,7 +168,7 @@ class ResNetSegmentation(nn.Module):
         x3 = self.layer3(x2)      # [B,256, H/16, W/16]
         x4 = self.layer4(x3)      # [B,512, H/32, W/32]
 
-        # Decoder
+        # Decoder with skip connections
         d4 = F.interpolate(x4, size=x3.shape[-2:], mode="bilinear", align_corners=False)
         d4 = self.up4(d4)
 
@@ -235,15 +236,15 @@ def compute_metrics(logits, targets, threshold=0.5):
     code_pred = preds[:, 1:]
     code_gt = targets[:, 1:]
 
-    # mask IoU
+    # Mask IoU (Intersection over Union)
     inter = (mask_pred * mask_gt).sum(dim=(1, 2, 3))
     union = ((mask_pred + mask_gt) > 0).float().sum(dim=(1, 2, 3))
     mask_iou = ((inter + 1e-6) / (union + 1e-6)).mean().item()
 
-    # code bit accuracy（全部像素平均）
+    # Code bit accuracy (averaged over all pixels)
     code_acc = (code_pred == code_gt).float().mean().item()
 
-    # 前景区域内的 code accuracy
+    # Code accuracy within foreground region only
     fg = mask_gt.expand_as(code_gt)
     fg_count = fg.sum()
     if fg_count > 0:
@@ -372,19 +373,21 @@ def main():
         generator=torch.Generator().manual_seed(args.seed)
     )
 
+    pin_memory = torch.cuda.is_available()
+
     train_loader = DataLoader(
         train_set,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
     )
     val_loader = DataLoader(
         val_set,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
     )
 
     model = ResNetSegmentation(
@@ -450,10 +453,10 @@ if __name__ == "__main__":
 
 '''
 python train.py \
-    --data_root ./dataset \
+    --data_root ./dataset_normal \
     --save_dir ./checkpoints \
     --epochs 50 \
-    --batch_size 2 \
+    --batch_size 8 \
     --lr 1e-3 \
     --backbone resnet34
 
