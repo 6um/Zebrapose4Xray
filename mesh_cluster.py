@@ -1,148 +1,96 @@
-import os
 import numpy as np
 import pyvista as pv
 from sklearn.cluster import KMeans
 
+file = "./welsh-dragon-small-centered.stl"
+mesh = pv.read(file)
+vertices = np.array(mesh.points)
 
-def ensure_triangular(mesh: pv.PolyData) -> pv.PolyData:
-    """确保 mesh 是三角面片."""
-    if not mesh.is_all_triangles:
-        mesh = mesh.triangulate()
-    return mesh
+visualize = False
+max_level = 10
 
+from k_means_constrained import KMeansConstrained
 
-def get_face_centers_and_ids(mesh: pv.PolyData):
-    """
-    返回：
-    - centers: (n_faces, 3) 每个三角面的质心
-    - face_ids: 原始 face 的 cell id
-    """
-    mesh = ensure_triangular(mesh)
+def balanced_kmeans_split(X, random_state=42):
+    n = len(X)
 
-    # faces 格式: [3, v0, v1, v2, 3, v0, v1, v2, ...]
-    faces = mesh.faces.reshape(-1, 4)[:, 1:]   # (n_faces, 3)
-    vertices = mesh.points                      # (n_vertices, 3)
+    if n < 2:
+        return np.zeros(n, dtype=int)
 
-    # 每个三角面的质心
-    centers = vertices[faces].mean(axis=1)
+    half = n // 2
 
-    face_ids = np.arange(len(faces))
-    return centers, face_ids
-
-
-def extract_submesh_by_face_ids(mesh: pv.PolyData, face_ids: np.ndarray) -> pv.PolyData:
-    """根据 face/cell id 提取子 mesh，并清理无用点."""
-    if len(face_ids) == 0:
-        return pv.PolyData()
-
-    submesh = mesh.extract_cells(face_ids)
-    # extract_cells 可能返回 UnstructuredGrid，转成 PolyData
-    submesh = submesh.extract_surface().clean()
-    submesh = ensure_triangular(submesh)
-    return submesh
-
-
-def split_mesh_kmeans(mesh: pv.PolyData, random_state=0):
-    """
-    对当前 mesh 按 face centroid 做 2-cluster KMeans 切分.
-    返回 submesh0, submesh1
-    """
-    mesh = ensure_triangular(mesh)
-    centers, face_ids = get_face_centers_and_ids(mesh)
-
-    n_faces = len(face_ids)
-    if n_faces < 2:
-        return None, None
-
-    # KMeans 二分类
-    kmeans = KMeans(n_clusters=2, random_state=random_state, n_init=10)
-    labels = kmeans.fit_predict(centers)
-
-    ids0 = face_ids[labels == 0]
-    ids1 = face_ids[labels == 1]
-
-    # 极端情况下某一类为空
-    if len(ids0) == 0 or len(ids1) == 0:
-        return None, None
-
-    submesh0 = extract_submesh_by_face_ids(mesh, ids0)
-    submesh1 = extract_submesh_by_face_ids(mesh, ids1)
-
-    if submesh0.n_cells == 0 or submesh1.n_cells == 0:
-        return None, None
-
-    return submesh0, submesh1
-
-
-def recursive_kmeans_save(
-    mesh: pv.PolyData,
-    out_dir: str,
-    max_depth: int = 5,
-    current_prefix: str = "",
-    random_state: int = 0
-):
-    """
-    递归二分保存:
-    - depth=1: 0,1
-    - depth=2: 00,01,10,11
-    ...
-    max_depth=5 表示最终保存到长度为 5 的编码
-    """
-    mesh = ensure_triangular(mesh)
-
-    # 当前层还要继续分
-    if len(current_prefix) >= max_depth:
-        return
-
-    submesh0, submesh1 = split_mesh_kmeans(mesh, random_state=random_state)
-
-    # 如果无法继续分，就停止
-    if submesh0 is None or submesh1 is None:
-        print(f"[停止] prefix='{current_prefix}' 无法继续二分，当前 cells={mesh.n_cells}")
-        return
-
-    name0 = current_prefix + "0"
-    name1 = current_prefix + "1"
-
-    path0 = os.path.join(out_dir, f"{name0}.stl")
-    path1 = os.path.join(out_dir, f"{name1}.stl")
-
-    submesh0.save(path0)
-    submesh1.save(path1)
-
-    print(f"[保存] {path0} | points={submesh0.n_points}, faces={submesh0.n_cells}")
-    print(f"[保存] {path1} | points={submesh1.n_points}, faces={submesh1.n_cells}")
-
-    # 继续递归
-    recursive_kmeans_save(
-        submesh0, out_dir, max_depth=max_depth,
-        current_prefix=name0, random_state=random_state
-    )
-    recursive_kmeans_save(
-        submesh1, out_dir, max_depth=max_depth,
-        current_prefix=name1, random_state=random_state
+    clf = KMeansConstrained(
+        n_clusters=2,
+        size_min=half,
+        size_max=n - half,
+        random_state=random_state
     )
 
+    labels = clf.fit_predict(X)
+    return labels
 
-if __name__ == "__main__":
-    file = "/Users/haoguangwang/TUM/25ws/Zebrapose/welsh-dragon-small-centered.stl"
-    out_dir = "mesh_clusters_depth5"
+# Level 1
+kmeans = KMeans(n_clusters=2, random_state=42, n_init=10)
+labels_prev = kmeans.fit_predict(vertices)
+# labels_prev = balanced_kmeans_split(vertices)
 
-    os.makedirs(out_dir, exist_ok=True)
+mesh_level_1 = pv.read(file)
+mesh_level_1["clusters"] = labels_prev
+mesh_level_1.save("binary_level_1.vtk")
 
-    mesh = pv.read(file)
-    mesh = ensure_triangular(mesh)
+print("Level 1 - 2 clusters:")
+for i in range(2):
+    print(f"  Cluster {i}: {np.sum(labels_prev == i)} vertices")
 
-    print("原始 mesh:")
-    print(f"  points = {mesh.n_points}")
-    print(f"  faces  = {mesh.n_cells}")
+if visualize:
+    plotter = pv.Plotter()
+    plotter.add_mesh(mesh_level_1, scalars="clusters", cmap="Greys", show_edges=False, show_scalar_bar=False)
+    plotter.add_axes()
+    plotter.show()
 
-    recursive_kmeans_save(
-        mesh=mesh,
-        out_dir=out_dir,
-        max_depth=5,
-        current_prefix="",
-        random_state=42
-    )
+# Level 2 ~ max_level
+for level in range(2, max_level + 1):
+    num_prev_clusters = 2 ** (level - 1)
+    num_clusters = 2 ** level
+    labels_current = np.zeros(len(vertices), dtype=int)
 
-    print(f"\n完成，输出目录: {out_dir}")
+    # for cluster_id in range(num_prev_clusters):
+    #     mask = labels_prev == cluster_id
+    #     vertices_cluster = vertices[mask]
+    #
+    #     if len(vertices_cluster) >= 2:
+    #         sub_labels = balanced_kmeans_split(vertices_cluster)
+    #         labels_current[mask] = sub_labels + cluster_id * 2
+    #     else:
+    #         labels_current[mask] = cluster_id * 2
+
+    for cluster_id in range(num_prev_clusters):
+        mask = labels_prev == cluster_id
+        vertices_cluster = vertices[mask]
+
+        if len(vertices_cluster) >= 2:
+            kmeans = KMeans(n_clusters=2, random_state=42, n_init=10)
+            sub_labels = kmeans.fit_predict(vertices_cluster)
+            labels_current[mask] = sub_labels + cluster_id * 2
+        elif len(vertices_cluster) == 1:
+            labels_current[mask] = cluster_id * 2
+
+    mesh_current = pv.read(file)
+    mesh_current["clusters"] = labels_current
+    mesh_current.save(f"binary_level_{level}.vtk")
+
+    print(f"Level {level} - {num_clusters} clusters:")
+    for i in range(num_clusters):
+        count = np.sum(labels_current == i)
+        if count > 0:
+            print(f"  Cluster {i}: {count} vertices")
+
+    if visualize:
+        plotter = pv.Plotter()
+        plotter.add_mesh(mesh_current, scalars="clusters", cmap="viridis", show_edges=False, show_scalar_bar=False)
+        plotter.add_axes()
+        plotter.show()
+
+    labels_prev = labels_current.copy()
+
+print(f"\nClustering complete up to level {max_level}!")
