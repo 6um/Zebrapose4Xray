@@ -568,11 +568,3 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
-
-'''
-python run_all_ids.py \
-    --output_root ./dataset_normal \
-    --start_id 0 \
-    --num_samples 400
-
-'''

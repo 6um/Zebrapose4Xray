@@ -3,7 +3,6 @@ import glob
 import random
 import json
 import csv
-from pathlib import Path
 
 import numpy as np
 from PIL import Image
@@ -68,11 +67,11 @@ class XrayCodeDataset(Dataset):
         xray = Image.open(xray_path).convert("L")
         xray = np.array(xray, dtype=np.float32) / 255.0
 
-        mask = np.load(mask_path).astype(np.float32)
-        code_stack = np.load(code_path).astype(np.float32)
+        mask = np.load(mask_path).astype(np.float32)         # [H, W]
+        code_stack = np.load(code_path).astype(np.float32)   # [10, H, W]
 
-        x = np.expand_dims(xray, axis=0)
-        y = np.concatenate([mask[None, ...], code_stack], axis=0)
+        x = np.expand_dims(xray, axis=0)                     # [1, H, W]
+        y = np.concatenate([mask[None, ...], code_stack], axis=0)  # [11, H, W]
 
         x = torch.from_numpy(x)
         y = torch.from_numpy(y)
@@ -123,13 +122,12 @@ class ResNetSegmentation(nn.Module):
             base.bn1,
             base.relu
         )
-        self.maxpool = base.maxpool  # downsample /4
-        self.layer1 = base.layer1  # /4
-        self.layer2 = base.layer2  # /8
-        self.layer3 = base.layer3  # /16
-        self.layer4 = base.layer4  # /32
+        self.maxpool = base.maxpool  # /4
+        self.layer1 = base.layer1    # /4
+        self.layer2 = base.layer2    # /8
+        self.layer3 = base.layer3    # /16
+        self.layer4 = base.layer4    # /32
 
-        # Decoder
         self.up4 = self._up_block(feat_channels[4], 256)
         self.up3 = self._up_block(256 + feat_channels[3], 128)
         self.up2 = self._up_block(128 + feat_channels[2], 64)
@@ -153,7 +151,6 @@ class ResNetSegmentation(nn.Module):
         )
 
     def forward(self, x):
-        # Encoder
         x0 = self.stem(x)         # [B, 64, H/2,  W/2]
         x1 = self.maxpool(x0)     # [B, 64, H/4,  W/4]
         x1 = self.layer1(x1)      # [B, 64, H/4,  W/4]
@@ -161,7 +158,6 @@ class ResNetSegmentation(nn.Module):
         x3 = self.layer3(x2)      # [B,256, H/16, W/16]
         x4 = self.layer4(x3)      # [B,512, H/32, W/32]
 
-        # Decoder with skip connections
         d4 = F.interpolate(x4, size=x3.shape[-2:], mode="bilinear", align_corners=False)
         d4 = self.up4(d4)
 
@@ -186,32 +182,130 @@ class ResNetSegmentation(nn.Module):
 
 
 # ============================================================
-# 4. Loss
+# 4. Hierarchical Loss
 # ============================================================
 
-class MultiTaskLoss(nn.Module):
-    def __init__(self, mask_weight: float = 2.0, code_weight: float = 1.0):
+class HierarchicalMultiTaskLoss(nn.Module):
+    """
+    Paper-style loss:
+
+        L_total = L_mask + alpha * L_hier
+
+    where:
+        L_mask = L1(sigmoid(mask_logits), mask_targets)
+
+        L_hier = sum_j w_j * BCE_j
+        BCE_j only computed inside valid mask region
+
+    Notes:
+    - use_pred_mask_for_code=False: use GT mask for code supervision (more stable)
+    - use_pred_mask_for_code=True : use predicted mask (closer to paper wording)
+    """
+    def __init__(
+        self,
+        num_code_bits: int = 10,
+        alpha: float = 1.0,
+        sigma: float = 3.0,
+        momentum: float = 0.9,
+        use_pred_mask_for_code: bool = False,
+        eps: float = 1e-6,
+    ):
         super().__init__()
-        self.mask_weight = mask_weight
-        self.code_weight = code_weight
-        self.bce = nn.BCEWithLogitsLoss()
+        self.num_code_bits = num_code_bits
+        self.alpha = alpha
+        self.sigma = sigma
+        self.momentum = momentum
+        self.use_pred_mask_for_code = use_pred_mask_for_code
+        self.eps = eps
+
+        self.code_bce = nn.BCEWithLogitsLoss(reduction="none")
+
+        self.register_buffer("bit_error_hist", torch.zeros(num_code_bits))
+        self.register_buffer("bit_weights", torch.ones(num_code_bits))
+
+    @torch.no_grad()
+    def _update_bit_weights(self, code_logits, code_targets, valid_mask):
+        """
+        code_logits:  [B, 10, H, W]
+        code_targets: [B, 10, H, W]
+        valid_mask:   [B, 1, H, W]
+        """
+        probs = torch.sigmoid(code_logits)
+        pred_bits = (probs > 0.5).float()
+
+        valid_mask_expand = valid_mask.expand_as(code_targets)  # [B,10,H,W]
+        bit_error_map = (pred_bits != code_targets).float() * valid_mask_expand
+
+        denom = valid_mask_expand.sum(dim=(0, 2, 3)).clamp_min(1.0)   # [10]
+        curr_error = bit_error_map.sum(dim=(0, 2, 3)) / denom         # [10]
+
+        self.bit_error_hist.mul_(self.momentum).add_(curr_error * (1.0 - self.momentum))
+
+        # paper-like weighting:
+        # w_j(t) = exp(sigma * min(H_j(t), 0.5 - H_j(t)))
+        temp = torch.minimum(self.bit_error_hist, 0.5 - self.bit_error_hist)
+        weights = torch.exp(self.sigma * temp)
+
+        # normalize so average weight is ~1
+        weights = weights / weights.sum().clamp_min(self.eps) * self.num_code_bits
+        self.bit_weights.copy_(weights)
 
     def forward(self, logits, targets):
         """
         logits:  [B, 11, H, W]
         targets: [B, 11, H, W]
         """
-        mask_logits = logits[:, 0:1]
-        code_logits = logits[:, 1:]
+        mask_logits = logits[:, 0:1]   # [B,1,H,W]
+        code_logits = logits[:, 1:]    # [B,10,H,W]
 
         mask_targets = targets[:, 0:1]
         code_targets = targets[:, 1:]
 
-        mask_loss = self.bce(mask_logits, mask_targets)
-        code_loss = self.bce(code_logits, code_targets)
+        # ------------------------------------------------
+        # 1) mask loss: sigmoid + L1
+        # ------------------------------------------------
+        mask_probs = torch.sigmoid(mask_logits)
+        mask_loss = F.l1_loss(mask_probs, mask_targets)
 
-        total_loss = self.mask_weight * mask_loss + self.code_weight * code_loss
-        return total_loss, mask_loss.detach(), code_loss.detach()
+        # ------------------------------------------------
+        # 2) valid region for code supervision
+        # ------------------------------------------------
+        if self.use_pred_mask_for_code:
+            valid_mask = (mask_probs > 0.5).float()
+        else:
+            valid_mask = mask_targets
+
+        valid_mask_expand = valid_mask.expand_as(code_targets)  # [B,10,H,W]
+
+        # ------------------------------------------------
+        # 3) per-pixel BCE on code
+        # ------------------------------------------------
+        code_loss_map = self.code_bce(code_logits, code_targets)   # [B,10,H,W]
+        code_loss_map = code_loss_map * valid_mask_expand
+
+        # average per bit over valid pixels
+        denom = valid_mask_expand.sum(dim=(0, 2, 3)).clamp_min(1.0)   # [10]
+        bit_loss = code_loss_map.sum(dim=(0, 2, 3)) / denom           # [10]
+
+        # ------------------------------------------------
+        # 4) update hierarchical weights
+        # ------------------------------------------------
+        self._update_bit_weights(code_logits.detach(), code_targets, valid_mask)
+
+        # ------------------------------------------------
+        # 5) weighted sum over bits
+        # ------------------------------------------------
+        code_loss = (bit_loss * self.bit_weights).sum()
+
+        total_loss = mask_loss + self.alpha * code_loss
+
+        return (
+            total_loss,
+            mask_loss.detach(),
+            code_loss.detach(),
+            self.bit_weights.detach().clone(),
+            self.bit_error_hist.detach().clone(),
+        )
 
 
 # ============================================================
@@ -411,13 +505,16 @@ def train_one_epoch(model, loader, optimizer, criterion, device):
     total_mask_loss = 0.0
     total_code_loss = 0.0
 
+    last_bit_weights = None
+    last_bit_error_hist = None
+
     for x, y in loader:
         x = x.to(device)
         y = y.to(device)
 
         optimizer.zero_grad()
         logits = model(x)
-        loss, mask_loss, code_loss = criterion(logits, y)
+        loss, mask_loss, code_loss, bit_weights, bit_error_hist = criterion(logits, y)
         loss.backward()
         optimizer.step()
 
@@ -425,11 +522,16 @@ def train_one_epoch(model, loader, optimizer, criterion, device):
         total_mask_loss += mask_loss.item()
         total_code_loss += code_loss.item()
 
+        last_bit_weights = bit_weights
+        last_bit_error_hist = bit_error_hist
+
     n = len(loader)
     return {
         "loss": total_loss / n,
         "mask_loss": total_mask_loss / n,
         "code_loss": total_code_loss / n,
+        "bit_weights": last_bit_weights.cpu().tolist() if last_bit_weights is not None else [],
+        "bit_error_hist": last_bit_error_hist.cpu().tolist() if last_bit_error_hist is not None else [],
     }
 
 
@@ -442,19 +544,23 @@ def validate_one_epoch(model, loader, criterion, device):
     total_code_loss = 0.0
 
     metric_list = []
+    last_bit_weights = None
+    last_bit_error_hist = None
 
     for x, y in loader:
         x = x.to(device)
         y = y.to(device)
 
         logits = model(x)
-        loss, mask_loss, code_loss = criterion(logits, y)
+        loss, mask_loss, code_loss, bit_weights, bit_error_hist = criterion(logits, y)
 
         total_loss += loss.item()
         total_mask_loss += mask_loss.item()
         total_code_loss += code_loss.item()
 
         metric_list.append(compute_metrics(logits, y))
+        last_bit_weights = bit_weights
+        last_bit_error_hist = bit_error_hist
 
     n = len(loader)
 
@@ -467,6 +573,8 @@ def validate_one_epoch(model, loader, criterion, device):
         "loss": total_loss / n,
         "mask_loss": total_mask_loss / n,
         "code_loss": total_code_loss / n,
+        "bit_weights": last_bit_weights.cpu().tolist() if last_bit_weights is not None else [],
+        "bit_error_hist": last_bit_error_hist.cpu().tolist() if last_bit_error_hist is not None else [],
         **mean_metrics
     }
 
@@ -489,6 +597,14 @@ def main():
     parser.add_argument("--backbone", type=str, default="resnet18", choices=["resnet18", "resnet34"])
     parser.add_argument("--pretrained", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
+
+    # loss params
+    parser.add_argument("--alpha", type=float, default=1.0, help="weight for hierarchical code loss")
+    parser.add_argument("--sigma", type=float, default=3.0, help="weight sharpness for hierarchical bits")
+    parser.add_argument("--momentum", type=float, default=0.9, help="EMA momentum for bit error histogram")
+    parser.add_argument("--use_pred_mask_for_code", action="store_true",
+                        help="use predicted mask instead of GT mask for code supervision")
+
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -536,7 +652,14 @@ def main():
         pretrained=args.pretrained
     ).to(device)
 
-    criterion = MultiTaskLoss(mask_weight=2.0, code_weight=1.0)
+    criterion = HierarchicalMultiTaskLoss(
+        num_code_bits=10,
+        alpha=args.alpha,
+        sigma=args.sigma,
+        momentum=args.momentum,
+        use_pred_mask_for_code=args.use_pred_mask_for_code,
+    ).to(device)
+
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
     best_val_loss = float("inf")
@@ -580,6 +703,16 @@ def main():
             "val_code_fg_all_correct": float(val_log.get("code_fg_all_correct", 0.0)),
         }
 
+        # flatten bit weights / hist for csv friendliness
+        for i, w in enumerate(train_log.get("bit_weights", [])):
+            record[f"train_bit_weight_{i}"] = float(w)
+        for i, h in enumerate(train_log.get("bit_error_hist", [])):
+            record[f"train_bit_error_hist_{i}"] = float(h)
+        for i, w in enumerate(val_log.get("bit_weights", [])):
+            record[f"val_bit_weight_{i}"] = float(w)
+        for i, h in enumerate(val_log.get("bit_error_hist", [])):
+            record[f"val_bit_error_hist_{i}"] = float(h)
+
         history.append(record)
         save_history_json(history, history_json_path)
         save_history_csv(history, history_csv_path)
@@ -597,6 +730,7 @@ def main():
             f"val_fg_code_acc={val_log.get('fg_code_acc', 0.0):.4f} "
             f"val_code_fg_all_correct={val_log.get('code_fg_all_correct', 0.0):.4f}"
         )
+        print(f"           bit_weights={[round(v, 4) for v in train_log.get('bit_weights', [])]}")
 
         last_ckpt = os.path.join(args.save_dir, "last.pth")
         torch.save(
@@ -604,6 +738,7 @@ def main():
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
+                "criterion_state_dict": criterion.state_dict(),
                 "val_loss": val_log["loss"],
                 "args": vars(args),
                 "history": history,
@@ -621,6 +756,7 @@ def main():
                     "epoch": epoch,
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
+                    "criterion_state_dict": criterion.state_dict(),
                     "val_loss": val_log["loss"],
                     "args": vars(args),
                     "history": history,
@@ -647,18 +783,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-'''
-python train.py \
-    --data_root ./dataset_test \
-    --save_dir ./checkpoints \
-    --epochs 50 \
-    --batch_size 8 \
-    --lr 1e-3 \
-    --backbone resnet34
-
-'''
-

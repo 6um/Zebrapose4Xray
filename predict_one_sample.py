@@ -219,7 +219,7 @@ def save_bit_images(code_stack: np.ndarray, mask: np.ndarray, out_dir: str, pref
 
     return saved_paths
 
-def get_default_font(size=18):
+def get_default_font(size=22):
     try:
         return ImageFont.truetype("DejaVuSans.ttf", size)
     except Exception:
@@ -546,7 +546,7 @@ if __name__ == "__main__":
 '''
 
 python predict_one_sample.py \
-    --sample_dir ./dataset_normal/sample_000023 \
+    --sample_dir ./dataset_test/sample_000000 \
     --checkpoint ./checkpoints/best.pth
 
 '''
