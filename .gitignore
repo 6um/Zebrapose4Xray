@@ -17,7 +17,8 @@ venv/
 
 # 数据集
 data/
-dataset/
+dataset_pred/
+dataset_test/
 dataset_normal/
 
 # 日志

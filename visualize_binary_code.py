@@ -2,7 +2,7 @@
 
 import trimesh
 import pyvista as pv
-level = 2
+level = 8
 mesh_level_n = pv.read(f"binary_level_{level}.vtk")
 
 
@@ -16,3 +16,6 @@ plotter.add_axes()
 plotter.show()
 
 print(f"Level {level} visualization - binary cluster")
+
+
+

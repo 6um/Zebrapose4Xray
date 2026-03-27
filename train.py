@@ -1,6 +1,8 @@
 import os
 import glob
 import random
+import json
+import csv
 from pathlib import Path
 
 import numpy as np
@@ -16,7 +18,7 @@ from torchvision import models
 
 
 # ============================================================
-# 1. Random Seed 
+# 1. Random Seed
 # ============================================================
 
 def set_seed(seed: int = 42):
@@ -63,24 +65,17 @@ class XrayCodeDataset(Dataset):
         mask_path = os.path.join(sample_dir, "mask.npy")
         code_path = os.path.join(sample_dir, "code_stack.npy")
 
-        # xray: (H, W) uint8 -> float32 [0,1]
         xray = Image.open(xray_path).convert("L")
         xray = np.array(xray, dtype=np.float32) / 255.0
 
-        # mask: (H, W), 0/1
         mask = np.load(mask_path).astype(np.float32)
-
-        # code_stack: (10, H, W), 0/1
         code_stack = np.load(code_path).astype(np.float32)
 
-        # 输入 shape: (1, H, W)
         x = np.expand_dims(xray, axis=0)
-
-        # target shape: (11, H, W)
         y = np.concatenate([mask[None, ...], code_stack], axis=0)
 
-        x = torch.from_numpy(x)       # float32
-        y = torch.from_numpy(y)       # float32
+        x = torch.from_numpy(x)
+        y = torch.from_numpy(y)
 
         return x, y
 
@@ -91,8 +86,8 @@ class XrayCodeDataset(Dataset):
 
 class ResNetSegmentation(nn.Module):
     """
-    用 ResNet18 做 encoder，再用简单上采样 decoder 做像素级预测。
-    输出 11 通道：
+    ResNet encoder + simple decoder for pixel-wise prediction.
+    Output channels:
         0: mask
         1~10: code bits
     """
@@ -110,7 +105,6 @@ class ResNetSegmentation(nn.Module):
         else:
             raise ValueError(f"Unsupported backbone: {backbone}")
 
-        # Modify first convolution layer to accept single-channel input
         old_conv1 = base.conv1
         base.conv1 = nn.Conv2d(
             1, old_conv1.out_channels,
@@ -120,7 +114,6 @@ class ResNetSegmentation(nn.Module):
             bias=False
         )
 
-        # Initialize weights for single-channel input if using pretrained model
         if pretrained:
             with torch.no_grad():
                 base.conv1.weight[:] = old_conv1.weight.mean(dim=1, keepdim=True)
@@ -236,32 +229,179 @@ def compute_metrics(logits, targets, threshold=0.5):
     code_pred = preds[:, 1:]
     code_gt = targets[:, 1:]
 
-    # Mask IoU (Intersection over Union)
+    eps = 1e-6
+
+    # -------------------------
+    # Mask metrics
+    # -------------------------
     inter = (mask_pred * mask_gt).sum(dim=(1, 2, 3))
     union = ((mask_pred + mask_gt) > 0).float().sum(dim=(1, 2, 3))
-    mask_iou = ((inter + 1e-6) / (union + 1e-6)).mean().item()
+    # mask_iou:
+    # Intersection over Union (IoU) for the predicted mask.
+    # Measures the overlap between predicted foreground and ground-truth foreground.
+    # Value range: [0, 1], higher is better.
+    mask_iou = ((inter + eps) / (union + eps)).mean().item()
 
-    # Code bit accuracy (averaged over all pixels)
+    tp = ((mask_pred == 1) & (mask_gt == 1)).float().sum(dim=(1, 2, 3))
+    fp = ((mask_pred == 1) & (mask_gt == 0)).float().sum(dim=(1, 2, 3))
+    fn = ((mask_pred == 0) & (mask_gt == 1)).float().sum(dim=(1, 2, 3))
+    tn = ((mask_pred == 0) & (mask_gt == 0)).float().sum(dim=(1, 2, 3))
+
+    # mask_precision:
+    # Among all pixels predicted as foreground, how many are truly foreground.
+    # High precision means few false positive foreground pixels.
+    mask_precision = ((tp + eps) / (tp + fp + eps)).mean().item()
+
+    # mask_recall:
+    # Among all true foreground pixels, how many are successfully detected.
+    # High recall means few missed foreground pixels.
+    mask_recall = ((tp + eps) / (tp + fn + eps)).mean().item()
+
+    # mask_f1:
+    # Harmonic mean of mask precision and mask recall.
+    # Useful when both false positives and false negatives matter.
+    mask_f1 = ((2 * tp + eps) / (2 * tp + fp + fn + eps)).mean().item()
+
+    # mask_acc:
+    # Overall mask pixel accuracy over the whole image.
+    # Can be high even when foreground prediction is imperfect,
+    # especially if background occupies most pixels.
+    mask_acc = ((tp + tn + eps) / (tp + tn + fp + fn + eps)).mean().item()
+
+    # -------------------------
+    # Code metrics
+    # -------------------------
+
+    # code_acc:
+    # Bit-wise accuracy over all code channels and all pixels.
+    # This includes both foreground and background.
+    # Note: this metric can be inflated by easy background pixels,
+    # because background code values are usually all zero.
     code_acc = (code_pred == code_gt).float().mean().item()
 
-    # Code accuracy within foreground region only
+    # fg:
+    # Foreground mask expanded to all code channels.
+    # Used to evaluate code prediction only inside object regions.
     fg = mask_gt.expand_as(code_gt)
+
+    # bg:
+    # Background region expanded to all code channels.
+    bg = 1.0 - fg
+
     fg_count = fg.sum()
+    bg_count = bg.sum()
+
+    # fg_code_acc:
+    # Bit-wise code accuracy computed only inside foreground pixels.
+    # This is usually more meaningful than code_acc for your task,
+    # because binary codes are only semantically important on the object.
     if fg_count > 0:
-        fg_code_acc = ((code_pred == code_gt).float() * fg).sum() / (fg_count + 1e-6)
-        fg_code_acc = fg_code_acc.item()
+        fg_code_acc = (((code_pred == code_gt).float() * fg).sum() / (fg_count + eps)).item()
     else:
         fg_code_acc = 0.0
 
+    # bg_code_acc:
+    # Bit-wise code accuracy computed only on background pixels.
+    # Usually expected to be high because background code is typically zero.
+    # Mostly useful as a sanity check rather than a main evaluation metric.
+    if bg_count > 0:
+        bg_code_acc = (((code_pred == code_gt).float() * bg).sum() / (bg_count + eps)).item()
+    else:
+        bg_code_acc = 0.0
+
+    # bg_code_acc:
+    # Bit-wise code accuracy computed only on background pixels.
+    # Usually expected to be high because background code is typically zero.
+    # Mostly useful as a sanity check rather than a main evaluation metric.
+    code_tp_fg = (((code_pred == 1) & (code_gt == 1)).float() * fg).sum()
+    code_fp_fg = (((code_pred == 1) & (code_gt == 0)).float() * fg).sum()
+    code_fn_fg = (((code_pred == 0) & (code_gt == 1)).float() * fg).sum()
+
+    # code_bitwise_precision_fg:
+    # Among all predicted positive code bits in the foreground,
+    # how many are actually correct positive bits.
+    code_bitwise_precision_fg = ((code_tp_fg + eps) / (code_tp_fg + code_fp_fg + eps)).item()
+
+    # code_bitwise_recall_fg:
+    # Among all true positive code bits in the foreground,
+    # how many are successfully predicted.
+    code_bitwise_recall_fg = ((code_tp_fg + eps) / (code_tp_fg + code_fn_fg + eps)).item()
+
+    # code_bitwise_f1_fg:
+    # Harmonic mean of foreground bit-wise precision and recall.
+    # Gives a balanced summary of foreground code prediction quality.
+    code_bitwise_f1_fg = ((2 * code_tp_fg + eps) / (2 * code_tp_fg + code_fp_fg + code_fn_fg + eps)).item()
+
+    # Foreground full-code correctness:
+    # for each foreground pixel, all 10 bits must be correct
+
+    # bit_equal:
+    # Per-bit correctness map for the 10 code channels.
+    # Shape: [B, 10, H, W], value 1 means the bit is predicted correctly.
+    bit_equal = (code_pred == code_gt).float()
+
+    # all_bits_correct_per_pixel:
+    # Per-pixel strict correctness for the whole binary code.
+    # A pixel is counted as correct only if all 10 bits are correct simultaneously.
+    # This is much stricter than fg_code_acc.
+    all_bits_correct_per_pixel = (bit_equal.mean(dim=1, keepdim=True) == 1.0).float()
+
+    # fg_pixel_mask:
+    # Foreground mask at pixel level, shape [B, 1, H, W].
+    fg_pixel_mask = mask_gt
+
+    fg_pixel_count = fg_pixel_mask.sum()
+
+    # code_fg_all_correct:
+    # Foreground full-code accuracy.
+    # Measures the fraction of foreground pixels whose entire 10-bit code
+    # is predicted perfectly.
+    # This is one of the strictest and most informative metrics
+    # for structured binary code prediction.
+    if fg_pixel_count > 0:
+        code_fg_all_correct = ((all_bits_correct_per_pixel * fg_pixel_mask).sum() / (fg_pixel_count + eps)).item()
+    else:
+        code_fg_all_correct = 0.0
+
     return {
         "mask_iou": mask_iou,
+        "mask_precision": mask_precision,
+        "mask_recall": mask_recall,
+        "mask_f1": mask_f1,
+        "mask_acc": mask_acc,
         "code_acc": code_acc,
         "fg_code_acc": fg_code_acc,
+        "bg_code_acc": bg_code_acc,
+        "code_bitwise_precision_fg": code_bitwise_precision_fg,
+        "code_bitwise_recall_fg": code_bitwise_recall_fg,
+        "code_bitwise_f1_fg": code_bitwise_f1_fg,
+        "code_fg_all_correct": code_fg_all_correct,
     }
 
 
 # ============================================================
-# 6. Train / Val
+# 6. History saving
+# ============================================================
+
+def save_history_json(history, save_path):
+    with open(save_path, "w", encoding="utf-8") as f:
+        json.dump(history, f, indent=2, ensure_ascii=False)
+
+
+def save_history_csv(history, save_path):
+    if len(history) == 0:
+        return
+
+    fieldnames = list(history[0].keys())
+    with open(save_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in history:
+            writer.writerow(row)
+
+
+# ============================================================
+# 7. Train / Val
 # ============================================================
 
 def train_one_epoch(model, loader, optimizer, criterion, device):
@@ -317,11 +457,11 @@ def validate_one_epoch(model, loader, criterion, device):
         metric_list.append(compute_metrics(logits, y))
 
     n = len(loader)
-    mean_metrics = {
-        "mask_iou": np.mean([m["mask_iou"] for m in metric_list]),
-        "code_acc": np.mean([m["code_acc"] for m in metric_list]),
-        "fg_code_acc": np.mean([m["fg_code_acc"] for m in metric_list]),
-    }
+
+    mean_metrics = {}
+    if len(metric_list) > 0:
+        for k in metric_list[0].keys():
+            mean_metrics[k] = float(np.mean([m[k] for m in metric_list]))
 
     return {
         "loss": total_loss / n,
@@ -332,7 +472,7 @@ def validate_one_epoch(model, loader, criterion, device):
 
 
 # ============================================================
-# 7. Main
+# 8. Main
 # ============================================================
 
 def main():
@@ -400,10 +540,49 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
     best_val_loss = float("inf")
+    best_epoch = -1
+
+    history = []
+    history_json_path = os.path.join(args.save_dir, "history.json")
+    history_csv_path = os.path.join(args.save_dir, "history.csv")
+    best_info_path = os.path.join(args.save_dir, "best_metrics.json")
 
     for epoch in range(1, args.epochs + 1):
         train_log = train_one_epoch(model, train_loader, optimizer, criterion, device)
         val_log = validate_one_epoch(model, val_loader, criterion, device)
+
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        record = {
+            "epoch": epoch,
+            "lr": float(current_lr),
+
+            "train_loss": float(train_log["loss"]),
+            "train_mask_loss": float(train_log["mask_loss"]),
+            "train_code_loss": float(train_log["code_loss"]),
+
+            "val_loss": float(val_log["loss"]),
+            "val_mask_loss": float(val_log["mask_loss"]),
+            "val_code_loss": float(val_log["code_loss"]),
+
+            "val_mask_iou": float(val_log.get("mask_iou", 0.0)),
+            "val_mask_precision": float(val_log.get("mask_precision", 0.0)),
+            "val_mask_recall": float(val_log.get("mask_recall", 0.0)),
+            "val_mask_f1": float(val_log.get("mask_f1", 0.0)),
+            "val_mask_acc": float(val_log.get("mask_acc", 0.0)),
+
+            "val_code_acc": float(val_log.get("code_acc", 0.0)),
+            "val_fg_code_acc": float(val_log.get("fg_code_acc", 0.0)),
+            "val_bg_code_acc": float(val_log.get("bg_code_acc", 0.0)),
+            "val_code_bitwise_precision_fg": float(val_log.get("code_bitwise_precision_fg", 0.0)),
+            "val_code_bitwise_recall_fg": float(val_log.get("code_bitwise_recall_fg", 0.0)),
+            "val_code_bitwise_f1_fg": float(val_log.get("code_bitwise_f1_fg", 0.0)),
+            "val_code_fg_all_correct": float(val_log.get("code_fg_all_correct", 0.0)),
+        }
+
+        history.append(record)
+        save_history_json(history, history_json_path)
+        save_history_csv(history, history_csv_path)
 
         print(
             f"[Epoch {epoch:03d}] "
@@ -413,12 +592,12 @@ def main():
             f"val_loss={val_log['loss']:.4f} "
             f"val_mask={val_log['mask_loss']:.4f} "
             f"val_code={val_log['code_loss']:.4f} "
-            f"val_iou={val_log['mask_iou']:.4f} "
-            f"val_code_acc={val_log['code_acc']:.4f} "
-            f"val_fg_code_acc={val_log['fg_code_acc']:.4f}"
+            f"val_iou={val_log.get('mask_iou', 0.0):.4f} "
+            f"val_code_acc={val_log.get('code_acc', 0.0):.4f} "
+            f"val_fg_code_acc={val_log.get('fg_code_acc', 0.0):.4f} "
+            f"val_code_fg_all_correct={val_log.get('code_fg_all_correct', 0.0):.4f}"
         )
 
-        # 保存 last
         last_ckpt = os.path.join(args.save_dir, "last.pth")
         torch.save(
             {
@@ -427,13 +606,15 @@ def main():
                 "optimizer_state_dict": optimizer.state_dict(),
                 "val_loss": val_log["loss"],
                 "args": vars(args),
+                "history": history,
             },
             last_ckpt,
         )
 
-        # 保存 best
         if val_log["loss"] < best_val_loss:
             best_val_loss = val_log["loss"]
+            best_epoch = epoch
+
             best_ckpt = os.path.join(args.save_dir, "best.pth")
             torch.save(
                 {
@@ -442,23 +623,42 @@ def main():
                     "optimizer_state_dict": optimizer.state_dict(),
                     "val_loss": val_log["loss"],
                     "args": vars(args),
+                    "history": history,
                 },
                 best_ckpt,
             )
+
+            best_info = {
+                "best_epoch": best_epoch,
+                "best_val_loss": float(best_val_loss),
+                "metrics_at_best": record,
+            }
+            with open(best_info_path, "w", encoding="utf-8") as f:
+                json.dump(best_info, f, indent=2, ensure_ascii=False)
+
             print(f"[INFO] Best model saved to {best_ckpt}")
+
+    print(f"[INFO] Training finished. Best epoch = {best_epoch}, best val_loss = {best_val_loss:.6f}")
+    print(f"[INFO] History saved to:")
+    print(f"       {history_json_path}")
+    print(f"       {history_csv_path}")
+    print(f"       {best_info_path}")
 
 
 if __name__ == "__main__":
     main()
 
+
+
+
 '''
 python train.py \
-    --data_root ./dataset_normal \
+    --data_root ./dataset_test \
     --save_dir ./checkpoints \
     --epochs 50 \
     --batch_size 8 \
     --lr 1e-3 \
     --backbone resnet34
 
-
 '''
+
