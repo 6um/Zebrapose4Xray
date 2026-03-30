@@ -119,6 +119,24 @@ python train.py \
     --use_pred_mask_for_code
 ```
 
+```
+python train.py \
+    --data_root ./dataset_normal \
+    --save_dir ./checkpoints \
+    --epochs 50 \
+    --batch_size 8 \
+    --lr 3e-4 \
+    --backbone resnet34 \
+    --alpha 1.5 \
+    --sigma 5.0 \
+    --momentum 0.7 \
+    --use_pred_mask_for_code
+```
+
+
+
+
+
 ### Training with Pretrained Backbone
 
 ```bash
@@ -157,3 +175,12 @@ python analyze_training_results.py \
 - Binary codes are only meaningful inside object regions (`mask == 1`).
 - Background pixels are always zero.
 - `code_vis.png` is intended only for visualization, not training.
+
+
+
+
+
+
+
+
+

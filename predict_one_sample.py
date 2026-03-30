@@ -546,7 +546,7 @@ if __name__ == "__main__":
 '''
 
 python predict_one_sample.py \
-    --sample_dir ./dataset_test/sample_000000 \
+    --sample_dir ./dataset_pred/sample_002026 \
     --checkpoint ./checkpoints/best.pth
 
 '''
