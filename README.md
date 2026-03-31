@@ -9,7 +9,7 @@
 
 ## Workflow
 
-![pipeline](/Users/haoguangwang/TUM/courseCode/Zebrapose4Xray/README.assets/pipeline.jpg)
+![pipeline](./README.assets/pipeline.jpg)
 
 ### 1. Mesh Clustering
 
