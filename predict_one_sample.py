@@ -171,8 +171,28 @@ def pack_code_stack_to_uint16(code_stack: np.ndarray) -> np.ndarray:
     return packed
 
 
-def make_code_visualization(packed_code: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    vis = (packed_code.astype(np.float32) / 1023.0 * 255.0).clip(0, 255).astype(np.uint8)
+# def make_code_visualization(packed_code: np.ndarray, mask: np.ndarray) -> np.ndarray:
+#     vis = (packed_code.astype(np.float32) / 1023.0 * 255.0).clip(0, 255).astype(np.uint8)
+#     vis[mask == 0] = 0
+#     return vis
+
+def make_code_visualization(packed_code: np.ndarray, mask: np.ndarray, n: int = 6) -> np.ndarray:
+    """
+    packed_code: uint16 in [0, 1023]
+    mask: uint8 in {0,1}
+    n: if provided, only visualize the first n bits in packing order
+       (i.e. bits 0 ~ n-1)
+    """
+    if n is not None:
+        if not (1 <= n <= 10):
+            raise ValueError(f"n must be in [1, 10], but got {n}")
+        max_val = float((1 << n) - 1)
+        code = packed_code & int(max_val)
+    else:
+        code = packed_code
+        max_val = 1023.0
+
+    vis = (code.astype(np.float32) / max_val * 255.0).clip(0, 255).astype(np.uint8)
     vis[mask == 0] = 0
     return vis
 
